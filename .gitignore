@@ -1,0 +1,34 @@
+
+# Compiled objects and binaries
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+
+# Build directories and generated files
+build/
+bin/
+dist/
+*.d
+compile_commands.json
+
+# Debugging and profiling output
+core
+core.*
+*.gcda
+*.gcno
+*.gcov
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
