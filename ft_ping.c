@@ -1,333 +1,619 @@
+#define _DEFAULT_SOURCE
 #include <netinet/ip_icmp.h>
 #include <netinet/ip.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <sys/time.h>
 #include <stdbool.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <signal.h>
 #include <errno.h>
 #include <netdb.h>
 #include <stdio.h>
 #include <math.h>
+#include <time.h>
 
-#define PING_DATALEN 56
-#define ICMP_HDRLEN  8
-#define PING_PKTLEN  (ICMP_HDRLEN + PING_DATALEN)
+#define DEFAULT_SIZE 56
+#define MAX_SIZE 65507
+#define DEFAULT_INTERVAL 1.0
 
-#define DBG(fmt, ...) if (G_DEBUG) fprintf(stderr, "\033[31m[debug]\033[0m %s: " fmt "\n", __func__, ##__VA_ARGS__)
-
-typedef struct s_icmp_header {
-	uint8_t  type;
-	uint8_t  code;
-	uint16_t checksum;
-	uint16_t identifier;
-	uint16_t sequence_number;
-} t_icmp_header;
-
-typedef struct s_flags {
-	bool debug;
-	bool bell;
-	bool limit;
-} t_flags;
+typedef struct s_options {
+	bool verbose;
+	bool flood;
+	bool numeric;
+	bool bypass;
+	bool have_deadline;
+	bool have_timeout;
+	bool have_ttl;
+	bool have_tos;
+	bool have_pattern;
+	bool have_ip_timestamp;
+	unsigned int preload;
+	double deadline;
+	double timeout;
+	double interval;
+	size_t size;
+	int ttl;
+	int tos;
+	unsigned char pattern[16];
+	size_t pattern_len;
+	const char *host;
+} t_options;
 
 typedef struct s_ping {
-	int                 sockfd;
-	struct sockaddr_in  dest;
-	char                dest_ip[INET_ADDRSTRLEN];
-	const char         *hostname;
-	uint16_t            id;
-	uint16_t            seq;
-	unsigned int        sent;
-	unsigned int        received;
-	double              rtt_min;
-	double              rtt_max;
-	double              rtt_sum;
-	double              rtt_sumsq;
+	int fd;
+	struct sockaddr_in dest;
+	char address[INET_ADDRSTRLEN];
+	char name[NI_MAXHOST];
+	t_options opt;
+	uint16_t id;
+	uint16_t seq;
+	unsigned long sent;
+	unsigned long received;
+	unsigned long errors;
+	double min;
+	double max;
+	double sum;
+	double sumsq;
+	struct timeval started;
+	struct timeval last_send;
 } t_ping;
 
-static int G_DEBUG = 0;
 static volatile sig_atomic_t g_running = 1;
 
-static void on_sigint(int sig) {
+static void on_sigint(int sig)
+{
 	(void)sig;
 	g_running = 0;
 }
 
-
-int gen_icmpsock(void) {
-	int sockfd;
-
-	DBG("creating raw ICMP socket");
-	sockfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-	if (sockfd < 0) {
-		perror("socket");
-		exit(1);
-	}
-	return sockfd;
+static double elapsed_ms(const struct timeval *a, const struct timeval *b) {
+	return (b->tv_sec - a->tv_sec) * 1000.0
+		+ (b->tv_usec - a->tv_usec) / 1000.0;
 }
 
-static uint16_t checksum(void *data, size_t len) {
-	uint16_t *words = data;
-	uint32_t  sum = 0;
+static double elapsed_sec(const struct timeval *a, const struct timeval *b) {
+	return elapsed_ms(a, b) / 1000.0;
+}
 
-	DBG("len=%zu data=%p", len, data);
+static int parse_unsigned(const char *str, unsigned long max, unsigned long *out) {
+	char *end;
+	unsigned long n;
+	if (!str || !*str || *str == '-')
+		return -1;
+	errno = 0;
+	n = strtoul(str, &end, 10);
+	if (errno || *end || n > max)
+		return -1;
+	*out = n;
+	return 0;
+}
 
+static int parse_double(const char *str, double *out) {
+	char *end;
+	double n;
+	if (!str || !*str || *str == '-')
+		return -1;
+	errno = 0;
+	n = strtod(str, &end);
+	if (errno || *end || n <= 0.0)
+		return -1;
+	*out = n;
+	return 0;
+}
+
+static void usage(FILE *out) {
+	fputs("Usage: ft_ping [OPTION...] HOST\n"
+		"Send ICMP ECHO_REQUEST packets to network hosts.\n\n"
+		"  -?, --help             give this help list\n"
+		"  -v, --verbose          verbose output\n"
+		"  -V, --version          print version and exit\n"
+		"  -f, --flood             send packets as quickly as possible\n"
+		"  -l, --preload=COUNT     send COUNT packets before the regular interval\n"
+		"  -n, --numeric           numeric output only\n"
+		"  -w, --deadline=SEC      stop after SEC seconds\n"
+		"  -W, --timeout=SEC       wait SEC seconds for each reply\n"
+		"  -p, --pattern=HEX       fill payload with a hexadecimal pattern\n"
+		"  -r, --ignore-routing    bypass normal routing tables\n"
+		"  -s, --size=SIZE         payload size in bytes\n"
+		"  -T, --tos=NUM           set IP type of service\n"
+		"      --ttl=NUM           set IP time to live\n"
+		"      --ip-timestamp      request an IP timestamp option\n"
+		"      --usage             give a short usage message\n"
+		"      --echo              send an echo request (compatibility option)\n\n"
+		"Examples:\n"
+		"  ft_ping example.com\n"
+		"  ft_ping --deadline=5 --size=120 192.0.2.1\n",
+		out);
+}
+
+static int parse_pattern(const char *s, t_options *o) {
+	size_t n = strlen(s), i;
+	if (n == 0 || (n & 1) || n > sizeof(o->pattern) * 2) return -1;
+	for (i = 0; i < n / 2; i++) {
+		unsigned int byte;
+		if (sscanf(s + i * 2, "%2x", &byte) != 1) return -1;
+		if (!((s[i*2] >= '0' && s[i*2] <= '9') || (s[i*2] >= 'a' && s[i*2] <= 'f') || (s[i*2] >= 'A' && s[i*2] <= 'F')) ||
+			!((s[i*2+1] >= '0' && s[i*2+1] <= '9') || (s[i*2+1] >= 'a' && s[i*2+1] <= 'f') || (s[i*2+1] >= 'A' && s[i*2+1] <= 'F'))) return -1;
+		o->pattern[i] = (unsigned char)byte;
+	}
+	o->pattern_len = n / 2;
+	o->have_pattern = true;
+	return 0;
+}
+
+static int option_value(int *i, int ac, char **av, const char *arg, const char *name, const char **value) {
+	size_t n = strlen(name);
+	if (strncmp(arg, name, n) != 0) return 0;
+	if (arg[n] == '=') { *value = arg + n + 1; return 1; }
+	if (arg[n] != '\0') return 0;
+	if (*i + 1 >= ac) return -1;
+	*value = av[++*i];
+	return 1;
+}
+
+static int read_option_value(int *index, int argc, char **argv,
+	const char *arg, const char *long_name, const char *short_name,
+	const char **value)
+{
+	int result = option_value(index, argc, argv, arg, long_name, value);
+	if (result != 0)
+		return result;
+	if (short_name && strcmp(arg, short_name) == 0) {
+		if (*index + 1 >= argc)
+			return -1;
+		*value = argv[++*index];
+		return 1;
+	}
+	if (short_name && arg[0] == '-' && arg[1] == short_name[1]
+		&& arg[2] != '\0') {
+		*value = arg + 2;
+		return 1;
+	}
+	return 0;
+}
+
+static int parse_options(int argc, char **argv, t_options *o,
+	const char **error)
+{
+	int i;
+	memset(o, 0, sizeof(*o));
+	o->size = DEFAULT_SIZE;
+	o->interval = DEFAULT_INTERVAL;
+
+	for (i = 1; i < argc; i++) {
+		const char *arg = argv[i];
+		const char *value = NULL;
+		unsigned long number;
+		int matched;
+
+		if (strcmp(arg, "--help") == 0 || strcmp(arg, "-?") == 0) {
+			usage(stdout);
+			exit(0);
+		}
+		if (strcmp(arg, "--usage") == 0) {
+			puts("Usage: ft_ping [OPTION...] HOST");
+			exit(0);
+		}
+		if (strcmp(arg, "--version") == 0 || strcmp(arg, "-V") == 0) {
+			puts("ft_ping (42 ft_ping) 1.0");
+			exit(0);
+		}
+		if (strcmp(arg, "--echo") == 0)
+			continue;
+		if (strcmp(arg, "--verbose") == 0 || strcmp(arg, "-v") == 0) {
+			o->verbose = true;
+			continue;
+		}
+		if (strcmp(arg, "--flood") == 0 || strcmp(arg, "-f") == 0) {
+			o->flood = true;
+			o->interval = 0.01;
+			continue;
+		}
+		if (strcmp(arg, "--numeric") == 0 || strcmp(arg, "-n") == 0) {
+			o->numeric = true;
+			continue;
+		}
+		if (strcmp(arg, "--ignore-routing") == 0 || strcmp(arg, "-r") == 0) {
+			o->bypass = true;
+			continue;
+		}
+		if (strcmp(arg, "--ip-timestamp") == 0) {
+			o->have_ip_timestamp = true;
+			continue;
+		}
+
+		matched = read_option_value(&i, argc, argv, arg, "--preload", "-l", &value);
+		if (matched != 0) {
+			if (matched < 0 || parse_unsigned(value, 1000000, &number) < 0) {
+				*error = "--preload expects a whole number between 0 and 1000000";
+				return -1;
+			}
+			o->preload = (unsigned int)number;
+			continue;
+		}
+
+		matched = read_option_value(&i, argc, argv, arg, "--deadline", "-w", &value);
+		if (matched != 0) {
+			if (matched < 0 || parse_double(value, &o->deadline) < 0) {
+				*error = "--deadline expects a number greater than zero";
+				return -1;
+			}
+			o->have_deadline = true;
+			continue;
+		}
+
+		matched = read_option_value(&i, argc, argv, arg, "--timeout", "-W", &value);
+		if (matched != 0) {
+			if (matched < 0 || parse_double(value, &o->timeout) < 0) {
+				*error = "--timeout expects a number greater than zero";
+				return -1;
+			}
+			o->have_timeout = true;
+			continue;
+		}
+
+		matched = read_option_value(&i, argc, argv, arg, "--size", "-s", &value);
+		if (matched != 0) {
+			if (matched < 0 || parse_unsigned(value, MAX_SIZE, &number) < 0) {
+				*error = "--size expects a whole number between 0 and 65507";
+				return -1;
+			}
+			o->size = (size_t)number;
+			continue;
+		}
+
+		matched = read_option_value(&i, argc, argv, arg, "--pattern", "-p", &value);
+		if (matched != 0) {
+			if (matched < 0 || parse_pattern(value, o) < 0) {
+				*error = "--pattern expects an even number of hexadecimal digits (up to 32)";
+				return -1;
+			}
+			continue;
+		}
+
+		matched = read_option_value(&i, argc, argv, arg, "--ttl", NULL, &value);
+		if (matched != 0) {
+			if (matched < 0 || parse_unsigned(value, 255, &number) < 0 || number == 0) {
+				*error = "--ttl expects a whole number between 1 and 255";
+				return -1;
+			}
+			o->ttl = (int)number;
+			o->have_ttl = true;
+			continue;
+		}
+
+		matched = read_option_value(&i, argc, argv, arg, "--tos", "-T", &value);
+		if (matched != 0) {
+			if (matched < 0 || parse_unsigned(value, 255, &number) < 0) {
+				*error = "--tos expects a whole number between 0 and 255";
+				return -1;
+			}
+			o->tos = (int)number;
+			o->have_tos = true;
+			continue;
+		}
+
+		if (arg[0] == '-') {
+			*error = "unknown option";
+			return -1;
+		}
+		if (o->host) {
+			*error = "please provide only one host";
+			return -1;
+		}
+		o->host = arg;
+	}
+	if (!o->host) {
+		*error = "please provide a host name or IPv4 address";
+		return -1;
+	}
+	return 0;
+}
+
+static uint16_t icmp_checksum(const unsigned char *data, size_t len) {
+	uint32_t sum = 0;
 	while (len > 1) {
-		sum += *words++;
+		sum += (uint16_t)((data[0] << 8) | data[1]);
+		data += 2;
 		len -= 2;
 	}
-	if (len == 1)
-		sum += *(uint8_t *)words;
+	if (len)
+		sum += (uint16_t)(data[0] << 8);
 	while (sum >> 16)
 		sum = (sum & 0xffff) + (sum >> 16);
 	return (uint16_t)~sum;
 }
 
-static double timeval_diff_ms(struct timeval *start, struct timeval *end) {
-	DBG("start=%ld.%06d end=%ld.%06d",
-		(long)start->tv_sec, (int)start->tv_usec,
-		(long)end->tv_sec, (int)end->tv_usec);
-	return (double)(end->tv_sec - start->tv_sec) * 1000.0
-		+ (double)(end->tv_usec - start->tv_usec) / 1000.0;
-}
-
-static int resolve_host(const char *host, t_ping *ping) {
+static int resolve_host(t_ping *p)
+{
 	struct addrinfo hints;
-	struct addrinfo *res;
-	int             err;
+	struct addrinfo *res = NULL;
+	int error;
 
-	DBG("host=%s", host);
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
-	hints.ai_socktype = SOCK_RAW;
-	hints.ai_protocol = IPPROTO_ICMP;
-	err = getaddrinfo(host, NULL, &hints, &res);
-	if (err != 0) {
-		fprintf(stderr, "ft_ping: unknown host %s\n", host);
+	hints.ai_socktype = SOCK_DGRAM;
+	error = getaddrinfo(p->opt.host, NULL, &hints, &res);
+	if (error || !res) {
+		fprintf(stderr, "ft_ping: cannot resolve '%s': %s\n", p->opt.host,
+			error ? gai_strerror(error) : "unknown host");
 		return -1;
 	}
-	memcpy(&ping->dest, res->ai_addr, sizeof(ping->dest));
-	inet_ntop(AF_INET, &ping->dest.sin_addr, ping->dest_ip, sizeof(ping->dest_ip));
+	memcpy(&p->dest, res->ai_addr, sizeof(p->dest));
 	freeaddrinfo(res);
+	if (!inet_ntop(AF_INET, &p->dest.sin_addr, p->address, sizeof(p->address)))
+		return -1;
+	if (p->opt.numeric
+		|| getnameinfo((struct sockaddr *)&p->dest, sizeof(p->dest), p->name,
+			sizeof(p->name), NULL, 0, NI_NAMEREQD) != 0) {
+		strncpy(p->name, p->address, sizeof(p->name) - 1);
+		p->name[sizeof(p->name) - 1] = '\0';
+	}
 	return 0;
 }
 
-static int send_echo(t_ping *ping) {
-	unsigned char   packet[PING_PKTLEN];
-	t_icmp_header  *icmp;
-	struct timeval  now;
-	ssize_t         n;
+static int open_socket(t_ping *p)
+{
+	int one = 1;
+	unsigned char timestamp[40];
 
-	DBG("seq=%u dest=%s", ping->seq, ping->dest_ip);
-	memset(packet, 0, sizeof(packet));
-	icmp = (t_icmp_header *)packet;
-	icmp->type = ICMP_ECHO;
-	icmp->code = 0;
-	icmp->checksum = 0;
-	icmp->identifier = htons(ping->id);
-	icmp->sequence_number = htons(ping->seq);
-
-	gettimeofday(&now, NULL);
-	memcpy(packet + ICMP_HDRLEN, &now, sizeof(now));
-	for (size_t i = sizeof(now); i < PING_DATALEN; i++)
-		packet[ICMP_HDRLEN + i] = (unsigned char)i;
-
-	icmp->checksum = checksum(packet, sizeof(packet));
-	DBG("sending packet to %s", ping->dest_ip);
-	n = sendto(ping->sockfd, packet, sizeof(packet), 0,
-		(struct sockaddr *)&ping->dest, sizeof(ping->dest));
-	if (n < 0) {
-		perror("sendto");
+	p->fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+	if (p->fd < 0) {
+		fprintf(stderr, "ft_ping: cannot open ICMP socket: %s\n", strerror(errno));
 		return -1;
 	}
-	ping->sent++;
-	ping->seq++;
+	if (p->opt.bypass
+		&& setsockopt(p->fd, SOL_SOCKET, SO_DONTROUTE, &one, sizeof(one)) < 0)
+		fprintf(stderr, "ft_ping: warning: cannot bypass routing: %s\n",
+			strerror(errno));
+	if (p->opt.have_ttl
+		&& setsockopt(p->fd, IPPROTO_IP, IP_TTL, &p->opt.ttl, sizeof(p->opt.ttl)) < 0)
+		fprintf(stderr, "ft_ping: warning: cannot set TTL: %s\n", strerror(errno));
+	if (p->opt.have_tos
+		&& setsockopt(p->fd, IPPROTO_IP, IP_TOS, &p->opt.tos, sizeof(p->opt.tos)) < 0)
+		fprintf(stderr, "ft_ping: warning: cannot set TOS: %s\n", strerror(errno));
+	if (p->opt.have_ip_timestamp) {
+		memset(timestamp, 0, sizeof(timestamp));
+		timestamp[0] = 68;
+		timestamp[1] = sizeof(timestamp);
+		timestamp[2] = 5;
+		if (setsockopt(p->fd, IPPROTO_IP, IP_OPTIONS, timestamp,
+			sizeof(timestamp)) < 0)
+			fprintf(stderr, "ft_ping: warning: cannot set IP timestamp: %s\n",
+				strerror(errno));
+	}
 	return 0;
 }
 
-static void record_rtt(t_ping *ping, double rtt) {
-	DBG("rtt=%.3f ms received=%u", rtt, ping->received);
-	if (ping->received == 1) {
-		ping->rtt_min = rtt;
-		ping->rtt_max = rtt;
-	} else {
-		if (rtt < ping->rtt_min)
-			ping->rtt_min = rtt;
-		if (rtt > ping->rtt_max)
-			ping->rtt_max = rtt;
+static int send_echo(t_ping *p)
+{
+	size_t packet_len = 8 + p->opt.size;
+	unsigned char *packet = calloc(1, packet_len);
+	struct timeval now;
+	ssize_t n;
+	uint16_t checksum;
+	size_t i;
+
+	if (!packet) {
+		fprintf(stderr, "ft_ping: unable to allocate packet buffer\n");
+		return -1;
 	}
-	ping->rtt_sum += rtt;
-	ping->rtt_sumsq += rtt * rtt;
+	packet[0] = ICMP_ECHO;
+	packet[4] = (unsigned char)(p->id >> 8);
+	packet[5] = (unsigned char)p->id;
+	packet[6] = (unsigned char)(p->seq >> 8);
+	packet[7] = (unsigned char)p->seq;
+	gettimeofday(&now, NULL);
+	if (p->opt.size >= sizeof(now))
+		memcpy(packet + 8, &now, sizeof(now));
+	for (i = sizeof(now); i < p->opt.size; i++) {
+		if (p->opt.have_pattern)
+			packet[8 + i] = p->opt.pattern[(i - sizeof(now)) % p->opt.pattern_len];
+		else
+			packet[8 + i] = (unsigned char)i;
+	}
+	checksum = icmp_checksum(packet, packet_len);
+	packet[2] = (unsigned char)(checksum >> 8);
+	packet[3] = (unsigned char)checksum;
+	n = sendto(p->fd, packet, packet_len, 0,
+		(struct sockaddr *)&p->dest, sizeof(p->dest));
+	free(packet);
+	if (n < 0) {
+		fprintf(stderr, "ft_ping: could not send packet: %s\n", strerror(errno));
+		p->errors++;
+		return -1;
+	}
+	p->sent++;
+	p->seq++;
+	p->last_send = now;
+	return 0;
 }
 
-static int recv_reply(t_ping *ping) {
-	unsigned char      buf[1024];
+static int recv_reply(t_ping *p)
+{
+	unsigned char buf[65536];
 	struct sockaddr_in from;
-	socklen_t          fromlen = sizeof(from);
-	ssize_t            n;
-	struct ip         *ip;
-	t_icmp_header     *icmp;
-	unsigned int       iphdrlen;
-	struct timeval     now;
-	struct timeval     sent_at;
-	double             rtt;
-
-	DBG("waiting on sockfd=%d", ping->sockfd);
-	n = recvfrom(ping->sockfd, buf, sizeof(buf), 0,
-		(struct sockaddr *)&from, &fromlen);
+	socklen_t flen = sizeof(from);
+	ssize_t n = recvfrom(p->fd, buf, sizeof(buf), 0,
+		(struct sockaddr *)&from, &flen);
+	size_t hlen;
+	struct ip *ip;
+	unsigned char *icmp;
+	unsigned int seq;
+	struct timeval now, sent;
+	double rtt = 0;
+	char addr[INET_ADDRSTRLEN];
 	if (n < 0) {
-		if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+		if (errno == EINTR || errno == EAGAIN)
 			return 0;
-		perror("recvfrom");
+		fprintf(stderr, "ft_ping: could not receive packet: %s\n", strerror(errno));
 		return -1;
 	}
-	if ((size_t)n < sizeof(struct ip) + ICMP_HDRLEN)
+	if ((size_t)n < sizeof(struct ip) + 8)
 		return 0;
-
 	ip = (struct ip *)buf;
-	iphdrlen = ip->ip_hl * 4;
-	if ((size_t)n < iphdrlen + ICMP_HDRLEN)
+	hlen = (size_t)ip->ip_hl * 4;
+	if (hlen < sizeof(struct ip) || (size_t)n < hlen + 8)
 		return 0;
-
-	icmp = (t_icmp_header *)(buf + iphdrlen);
-	if (icmp->type != ICMP_ECHOREPLY)
+	icmp = buf + hlen;
+	if (icmp[0] != ICMP_ECHOREPLY || ((uint16_t)icmp[4] << 8 | icmp[5]) != p->id) {
+		if (p->opt.verbose) {
+			inet_ntop(AF_INET, &from.sin_addr, addr, sizeof(addr));
+			printf("From %s: ICMP type=%u code=%u\n", addr, icmp[0], icmp[1]);
+		}
 		return 0;
-	if (ntohs(icmp->identifier) != ping->id)
-		return 0;
-
-	gettimeofday(&now, NULL);
-	rtt = 0.0;
-	if ((size_t)n >= iphdrlen + ICMP_HDRLEN + sizeof(struct timeval)) {
-		memcpy(&sent_at, buf + iphdrlen + ICMP_HDRLEN, sizeof(sent_at));
-		rtt = timeval_diff_ms(&sent_at, &now);
 	}
-	ping->received++;
-	record_rtt(ping, rtt);
-
-	printf("%ld bytes from %s: icmp_seq=%u ttl=%u time=%.3f ms\n",
-		(long)(n - iphdrlen),
-		inet_ntoa(from.sin_addr),
-		ntohs(icmp->sequence_number),
-		ip->ip_ttl,
-		rtt);
-	fflush(stdout);
+	seq = (unsigned int)icmp[6] << 8 | icmp[7];
+	gettimeofday(&now, NULL);
+	if ((size_t)n >= hlen + 8 + sizeof(sent)) {
+		memcpy(&sent, icmp + 8, sizeof(sent));
+		rtt = elapsed_ms(&sent, &now);
+	}
+	p->received++;
+	if (p->received == 1) {
+		p->min = rtt;
+		p->max = rtt;
+	} else {
+		if (rtt < p->min)
+			p->min = rtt;
+		if (rtt > p->max)
+			p->max = rtt;
+	}
+	p->sum += rtt;
+	p->sumsq += rtt * rtt;
+	inet_ntop(AF_INET, &from.sin_addr, addr, sizeof(addr));
+	if (p->opt.flood) {
+		putchar('\b');
+		fflush(stdout);
+	} else {
+		printf("%ld bytes from %s (%s): icmp_seq=%u ttl=%u time=%.3f ms\n",
+			(long)((size_t)n - hlen), p->name, addr, seq,
+			(unsigned int)ip->ip_ttl, rtt);
+	}
 	return 1;
 }
 
-static void print_stats(t_ping *ping) {
+static void print_stats(t_ping *p) {
+	struct timeval now;
 	double loss;
-	double avg;
-	double stddev;
+	double average;
+	double deviation;
 
-	DBG("sent=%u received=%u", ping->sent, ping->received);
-	printf("\n--- %s ping statistics ---\n", ping->hostname);
-	loss = 0.0;
-	if (ping->sent > 0)
-		loss = 100.0 * (ping->sent - ping->received) / ping->sent;
-	printf("%u packets transmitted, %u packets received, %.1f%% packet loss\n",
-		ping->sent, ping->received, loss);
-	if (ping->received > 0) {
-		avg = ping->rtt_sum / ping->received;
-		stddev = 0.0;
-		if (ping->received > 1) {
-			stddev = ping->rtt_sumsq / ping->received - avg * avg;
-			if (stddev < 0.0)
-				stddev = 0.0;
-			stddev = sqrt(stddev);
-		}
-		printf("round-trip min/avg/max/stddev = %.3f/%.3f/%.3f/%.3f ms\n",
-			ping->rtt_min, avg, ping->rtt_max, stddev);
+	gettimeofday(&now, NULL);
+	printf("\n--- %s ping statistics ---\n", p->opt.host);
+	loss = p->sent > 0
+		? 100.0 * (p->sent - p->received) / p->sent
+		: 0.0;
+	printf("%lu packets transmitted, %lu packets received, %.1f%% packet loss, "
+		"time %.0fms\n", p->sent, p->received, loss,
+		elapsed_ms(&p->started, &now));
+	if (p->received) {
+		average = p->sum / p->received;
+		deviation = p->sumsq / p->received - average * average;
+		if (deviation < 0)
+			deviation = 0;
+		printf("rtt min/avg/max/mdev = %.3f/%.3f/%.3f/%.3f ms\n",
+			p->min, average, p->max, sqrt(deviation));
 	}
 }
 
-static void ping_loop(t_ping *ping) {
-	struct timeval last_send;
-	struct timeval now;
-	struct timeval timeout;
-	fd_set         readfds;
-	int            ready;
-	double         elapsed;
 
-	DBG("start dest=%s", ping->dest_ip);
-	memset(&last_send, 0, sizeof(last_send));
+static void ping_loop(t_ping *p)
+{
+	struct timeval now;
+	struct timeval wait;
+	fd_set rfds;
+	double since_send;
+	double running;
+	unsigned int initial = p->opt.preload;
+	int ready;
+
+	gettimeofday(&p->started, NULL);
 	while (g_running) {
 		gettimeofday(&now, NULL);
-		elapsed = timeval_diff_ms(&last_send, &now);
-		if (last_send.tv_sec == 0 || elapsed >= 1000.0) {
-			if (send_echo(ping) < 0)
-				break;
-			last_send = now;
-			elapsed = 0.0;
+		running = elapsed_sec(&p->started, &now);
+		if (p->opt.have_deadline && running >= p->opt.deadline)
+			break;
+
+		if (initial > 0) {
+			send_echo(p);
+			initial--;
+		} else if (p->sent == 0
+			|| elapsed_sec(&p->last_send, &now) >= p->opt.interval) {
+			send_echo(p);
 		}
-		timeout.tv_sec = 0;
-		timeout.tv_usec = (suseconds_t)((1000.0 - elapsed) * 1000.0);
-		if (timeout.tv_usec < 0)
-			timeout.tv_usec = 0;
-		if (timeout.tv_usec >= 1000000)
-			timeout.tv_usec = 999999;
-		FD_ZERO(&readfds);
-		FD_SET(ping->sockfd, &readfds);
-		ready = select(ping->sockfd + 1, &readfds, NULL, NULL, &timeout);
-		if (ready < 0) {
-			if (errno == EINTR)
-				continue;
-			perror("select");
+
+		gettimeofday(&now, NULL);
+		since_send = elapsed_sec(&p->last_send, &now);
+		wait.tv_sec = 0;
+		if (initial > 0) {
+			wait.tv_usec = 0;
+		} else if (p->sent == 0) {
+			wait.tv_usec = 100000;
+		} else {
+			double remain = p->opt.interval - since_send;
+			double until_deadline;
+
+			if (p->opt.have_timeout
+				&& p->opt.timeout - since_send < remain)
+				remain = p->opt.timeout - since_send;
+			until_deadline = p->opt.deadline
+				- elapsed_sec(&p->started, &now);
+			if (p->opt.have_deadline && until_deadline < remain)
+				remain = until_deadline;
+			if (remain < 0.001)
+				remain = 0.001;
+			wait.tv_sec = (time_t)remain;
+			wait.tv_usec = (suseconds_t)((remain - wait.tv_sec) * 1000000.0);
+		}
+		FD_ZERO(&rfds);
+		FD_SET(p->fd, &rfds);
+		ready = select(p->fd + 1, &rfds, NULL, NULL, &wait);
+		if (ready > 0) {
+			recv_reply(p);
+		} else if (ready < 0 && errno != EINTR) {
+			fprintf(stderr, "ft_ping: waiting for packets failed: %s\n",
+				strerror(errno));
 			break;
 		}
-		if (ready > 0)
-			recv_reply(ping);
+		gettimeofday(&now, NULL);
+		if (p->opt.have_timeout && p->sent
+			&& elapsed_sec(&p->last_send, &now) >= p->opt.timeout
+			&& elapsed_sec(&p->last_send, &now) < p->opt.interval)
+			continue;
 	}
-	print_stats(ping);
+	print_stats(p);
 }
 
 int main(int ac, char **av) {
-	t_ping ping;
-	int i = -1;
-
-	DBG("ac=%d", ac);
-	if (ac != 2) {
-		fprintf(stderr, "Oops buddy, that's not how you use me, for further information, type './ft_ping --help'\n");
-		return 1;
+	t_ping p;
+	const char *option_error = NULL;
+	memset(&p, 0, sizeof(p));
+	if (parse_options(ac, av, &p.opt, &option_error) < 0) {
+		fprintf(stderr, "ft_ping: %s.\nTry 'ft_ping --help' for usage.\n",
+			option_error ? option_error : "invalid arguments");
+		return 2;
 	}
-
-	while (av[++i]) {
-		printf("av=%s\n", av[i]);
-		if (strcmp(av[i], "--debug") == 0) {
-			G_DEBUG = 1;
-		}
+	if (resolve_host(&p) < 0 || open_socket(&p) < 0)
+		return 2;
+	p.id = (uint16_t)getpid();
+	if (p.opt.flood && geteuid() != 0) {
+		fprintf(stderr, "ft_ping: flood mode requires root privileges\n");
+		close(p.fd);
+		return 2;
 	}
-
-	if (strcmp(av[1], "--help") == 0) {
-		printf("Usage: ft_ping [options] <hostname>\n");
-		printf("Options:\n");
-		printf("  -h, --help     Show this help message and exit\n");
-		printf("  -v, --version  Show version information and exit\n");
-		return 0;
-	}
-
-	memset(&ping, 0, sizeof(ping));
-	ping.hostname = av[1];
-	printf("hostname: %s\n", ping.hostname);
-	ping.id = (uint16_t)getpid();
-	ping.seq = 0;
-	ping.rtt_min = 0.0;
-
-	if (resolve_host(av[1], &ping) < 0)
-		return 1;
-
-	ping.sockfd = gen_icmpsock();
-
-	signal(SIGINT, on_sigint);
-
-	printf("PING %s (%s): %d data bytes\n",
-		ping.hostname, ping.dest_ip, PING_DATALEN);
+	if (p.opt.flood)
+		p.opt.interval = 0.01;
+	printf("PING %s (%s) %zu(%zu) bytes of data.\n", p.opt.host, p.address, p.opt.size, p.opt.size + 28);
 	fflush(stdout);
-
-	ping_loop(&ping);
-	close(ping.sockfd);
+	signal(SIGINT, on_sigint);
+	ping_loop(&p);
+	close(p.fd);
 	return 0;
 }
