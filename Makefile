@@ -1,13 +1,18 @@
 NAME = ft_ping
 CC = gcc
 CFLAGS = -Wall -Wextra -Werror
+CPPFLAGS = -Iincludes
 LDLIBS = -lm
-SRC = ft_ping.c
+
+SRC_DIR = src
+INC_DIR = includes
+SRC = $(SRC_DIR)/ft_ping.c $(SRC_DIR)/parse.c
+HDR = $(INC_DIR)/class.h $(INC_DIR)/parse.h
 
 all: $(NAME)
 
-$(NAME): $(SRC)
-	$(CC) $(CFLAGS) -o $(NAME) $(SRC) $(LDLIBS)
+$(NAME): $(SRC) $(HDR)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $(NAME) $(SRC) $(LDLIBS)
 
 tests: all
 	./ft_ping example.com
@@ -23,4 +28,4 @@ fclean: clean clean-objects
 
 re: fclean all
 
-.PHONY: all clean fclean re
+.PHONY: all clean clean-objects fclean re tests

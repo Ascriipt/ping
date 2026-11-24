@@ -32,3 +32,4 @@ core.*
 # OS files
 .DS_Store
 Thumbs.db
+ft_ping

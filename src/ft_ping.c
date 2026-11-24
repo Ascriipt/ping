@@ -18,51 +18,12 @@
 #include <math.h>
 #include <time.h>
 
+#include "class.h"
+#include "parse.h"
+
 #define DEFAULT_SIZE 56
 #define MAX_SIZE 65507
 #define DEFAULT_INTERVAL 1.0
-
-typedef struct s_options {
-	bool verbose;
-	bool flood;
-	bool numeric;
-	bool bypass;
-	bool have_deadline;
-	bool have_timeout;
-	bool have_ttl;
-	bool have_tos;
-	bool have_pattern;
-	bool have_ip_timestamp;
-	unsigned int preload;
-	double deadline;
-	double timeout;
-	double interval;
-	size_t size;
-	int ttl;
-	int tos;
-	unsigned char pattern[16];
-	size_t pattern_len;
-	const char *host;
-} t_options;
-
-typedef struct s_ping {
-	int fd;
-	struct sockaddr_in dest;
-	char address[INET_ADDRSTRLEN];
-	char name[NI_MAXHOST];
-	t_options opt;
-	uint16_t id;
-	uint16_t seq;
-	unsigned long sent;
-	unsigned long received;
-	unsigned long errors;
-	double min;
-	double max;
-	double sum;
-	double sumsq;
-	struct timeval started;
-	struct timeval last_send;
-} t_ping;
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -81,7 +42,7 @@ static double elapsed_sec(const struct timeval *a, const struct timeval *b) {
 	return elapsed_ms(a, b) / 1000.0;
 }
 
-static int parse_unsigned(const char *str, unsigned long max, unsigned long *out) {
+int parse_unsigned(const char *str, unsigned long max, unsigned long *out) {
 	char *end;
 	unsigned long n;
 	if (!str || !*str || *str == '-')
@@ -94,7 +55,7 @@ static int parse_unsigned(const char *str, unsigned long max, unsigned long *out
 	return 0;
 }
 
-static int parse_double(const char *str, double *out) {
+int parse_double(const char *str, double *out) {
 	char *end;
 	double n;
 	if (!str || !*str || *str == '-')
@@ -132,7 +93,7 @@ static void usage(FILE *out) {
 		out);
 }
 
-static int parse_pattern(const char *s, t_options *o) {
+int parse_pattern(const char *s, t_options *o) {
 	size_t n = strlen(s), i;
 	if (n == 0 || (n & 1) || n > sizeof(o->pattern) * 2) return -1;
 	for (i = 0; i < n / 2; i++) {
@@ -147,7 +108,7 @@ static int parse_pattern(const char *s, t_options *o) {
 	return 0;
 }
 
-static int option_value(int *i, int ac, char **av, const char *arg, const char *name, const char **value) {
+int option_value(int *i, int ac, char **av, const char *arg, const char *name, const char **value) {
 	size_t n = strlen(name);
 	if (strncmp(arg, name, n) != 0) return 0;
 	if (arg[n] == '=') { *value = arg + n + 1; return 1; }
@@ -157,7 +118,7 @@ static int option_value(int *i, int ac, char **av, const char *arg, const char *
 	return 1;
 }
 
-static int read_option_value(int *index, int argc, char **argv,
+int read_option_value(int *index, int argc, char **argv,
 	const char *arg, const char *long_name, const char *short_name,
 	const char **value)
 {
@@ -178,7 +139,7 @@ static int read_option_value(int *index, int argc, char **argv,
 	return 0;
 }
 
-static int parse_options(int argc, char **argv, t_options *o,
+int parse_options(int argc, char **argv, t_options *o,
 	const char **error)
 {
 	int i;
