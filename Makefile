@@ -14,9 +14,14 @@ all: $(NAME)
 $(NAME): $(SRC) $(HDR)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $(NAME) $(SRC) $(LDLIBS)
 
+# Compares ft_ping with the reference ping (inetutils-2.0).
+# Both need raw sockets, so the suite runs through sudo when not root.
+# Override the reference binary with: make tests REAL_PING=/path/to/ping
+REAL_PING ?= ping
+SUDO = $(shell [ "$$(id -u)" -eq 0 ] || echo sudo)
+
 tests: all
-	./ft_ping example.com
-	./ft_ping --deadline=5 --size=120 192.0.2.1
+	$(SUDO) env REAL_PING=$(REAL_PING) ./tests/run_tests.sh ./$(NAME)
 
 clean-objects:
 	rm -f $(SRC:.c=.o)
