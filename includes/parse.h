@@ -2,6 +2,10 @@
 
 #include "class.h"   /* t_options */
 
+#define DEFAULT_SIZE 56
+#define MAX_SIZE 65507
+#define DEFAULT_INTERVAL 1.0
+
 int parse_double(const char *str, double *out);
 int parse_unsigned(const char *str, unsigned long max, unsigned long *out);
 
