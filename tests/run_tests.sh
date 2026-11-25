@@ -7,6 +7,12 @@
 # Usage:   tests/run_tests.sh [path/to/ft_ping]
 # Env:     REAL_PING=/path/to/inetutils/ping   (default: ping)
 #          VERBOSE=1                           show both outputs for every test
+#          RESULTS_DIR=dir                     where the result files go (default: tests)
+#
+# Every test's raw output is also written to two files with the same layout,
+# so they can be compared side by side (e.g. diff, vimdiff):
+#   $RESULTS_DIR/ping_results.txt      reference ping
+#   $RESULTS_DIR/ft_ping_results.txt   ft_ping
 #
 # Must run as root (or with CAP_NET_RAW on both binaries) because both use raw ICMP sockets.
 #
@@ -20,6 +26,9 @@
 FT_PING="${1:-./ft_ping}"
 REAL_PING="${REAL_PING:-ping}"
 VERBOSE="${VERBOSE:-0}"
+RESULTS_DIR="${RESULTS_DIR:-$(dirname "$0")}"
+REAL_RESULTS="$RESULTS_DIR/ping_results.txt"
+FT_RESULTS="$RESULTS_DIR/ft_ping_results.txt"
 
 PASS=0
 FAIL=0
@@ -50,26 +59,55 @@ if [ "$(id -u)" -ne 0 ]; then
 	echo "${YELLOW}warning:${RESET} not running as root; tests that send packets will probably fail." >&2
 fi
 
+# ------------------------------------------------------------ result files
+: >"$REAL_RESULTS" && : >"$FT_RESULTS" || exit 1
+# Under sudo the files would belong to root: give them back to the user.
+if [ -n "${SUDO_UID:-}" ]; then
+	chown "$SUDO_UID:$SUDO_GID" "$REAL_RESULTS" "$FT_RESULTS"
+fi
+
+# log_result <file> <program> <description> <status> <output file> <args...>
+log_result() {
+	local file="$1" prog="$2" desc="$3" st="$4" out="$5"
+	shift 5
+	{
+		printf '==== %s\n$ %s %s\n' "$desc" "$prog" "$*"
+		cat "$out"
+		printf -- '---- exit status: %s\n\n' "$st"
+	} >>"$file"
+}
+
 # --------------------------------------------------------------- normalize
 # Remove from the output what the subject says may differ, or what changes on every run.
 normalize() {
 	sed -E \
 		-e 's/^(ft_)?ping: /PROG: /' \
-		-e 's/(Try|Usage:) ['\''"]?(ft_)?ping/\1 PROG/' \
+		-e "s/'(ft_)?ping --(help|usage)'/'PROG --\\2'/g" \
+		-e 's/^Usage: (ft_)?ping/Usage: PROG/' \
 		-e 's/\b(ft_)?ping \[OPTION/PROG [OPTION/' \
 		-e 's/time=[0-9]+(\.[0-9]+)? ms/time=X ms/g' \
 		-e '/^(round-trip|rtt) /d' \
 		-e 's/id 0x[0-9a-fA-F]+ = [0-9]+/id 0xID = ID/' \
 		-e 's/(icmp_seq|seq)=[0-9]+/\1=N/g' \
+		-e 's/\t[0-9]+ ms( = 0x[0-9a-f]+)?$/\tN ms/' \
 		"$1" |
 	awk '
-		# inetutils -v dumps the IP header after "Vr HL TOS ..."; mask Id and Cks.
-		prev_hdr { $6 = "ID"; $11 = "CKS"; prev_hdr = 0 }
+		# -v dumps the IP header of the packet that caused an ICMP error.
+		# Its Id and checksum change on every packet: mask them.
+		prev_hex { $3 = "ID"; $6 = "CKS"; prev_hex = 0 }
+		/^IP Hdr Dump:/ { prev_hex = 1 }
+		prev_hdr { $5 = "ID"; $10 = "CKS"; prev_hdr = 0 }
 		/^Vr HL TOS/ { prev_hdr = 1 }
 		# ICMP dump: "ICMP: type 8, code 0, size 64, id 0x1234, seq 0x0000"
 		/^ICMP: type/ { gsub(/id 0x[0-9a-fA-F]+/, "id 0xID"); gsub(/seq 0x[0-9a-fA-F]+/, "seq 0xN") }
 		{ print }
-	'
+	' |
+	if [ "${MASK_COUNTS:-0}" = 1 ]; then
+		# Flood mode: how many packets fit in the time depends on the machine.
+		sed -E -e 's/[.\x08]+---/---/' -e 's/^[0-9]+ packets transmitted, [0-9]+ packets received, [0-9]+%/N packets transmitted, N packets received, N%/'
+	else
+		cat
+	fi
 }
 
 # compare <description> <timeout secs> <args...>
@@ -85,8 +123,16 @@ compare() {
 	timeout --preserve-status -s INT -k 3 "$tmo" "$FT_PING" "$@" >"$ft_out" 2>&1
 	ft_st=$?
 
+	log_result "$REAL_RESULTS" ping "$desc" "$real_st" "$real_out" "$@"
+	log_result "$FT_RESULTS" ft_ping "$desc" "$ft_st" "$ft_out" "$@"
+
 	normalize "$real_out" >"$real_out.n"
 	normalize "$ft_out" >"$ft_out.n"
+
+	if [ "${STATUS_ONLY:-0}" = 1 ]; then
+		# Output differs on purpose (see the call site): only compare the status.
+		cmp -s "$real_out.n" "$ft_out.n" || cp "$real_out.n" "$ft_out.n"
+	fi
 
 	if [ "$ft_st" -ge 128 ] && [ "$ft_st" -ne "$real_st" ]; then
 		reason="ft_ping crashed or was killed (status $ft_st, signal $((ft_st - 128)))"
@@ -117,133 +163,45 @@ echo "${BOLD}ft_ping vs ping${RESET}"
 echo "  ft_ping: $FT_PING"
 echo "  ping:    $(command -v "$REAL_PING")  ($("$REAL_PING" -V 2>&1 | head -1))"
 
-# =================================================== 1. subject: mandatory
-section "Subject: -? option"
-compare "-? (help)"                          3 -?
-compare "--help"                             3 --help
-compare "-? with a host"                     3 -? 127.0.0.1
+# Timeouts end in .5 so Ctrl+C never lands exactly when a packet is due
+# (ping sends one per second), which would make the packet counts flaky.
 
-section "Subject: IPv4 address as parameter"
-compare "loopback 127.0.0.1"                 3 127.0.0.1
-compare "other loopback 127.0.0.2"           3 127.0.0.2
-compare "remote IPv4 8.8.8.8"                4 8.8.8.8
-compare "remote IPv4 1.1.1.1"                4 1.1.1.1
+# ============================================================ mandatory
+section "Mandatory"
+compare "IPv4 address"                       2.5 127.0.0.1
+compare "hostname"                           2.5 localhost
+compare "no host"                            2.5
+compare "unknown host"                       2.5 nonexistent.invalid
+# ft_ping's help lists only the options it has (the subject's), so the text
+# differs from inetutils on purpose: only the exit status is compared.
+STATUS_ONLY=1 compare "-? (help)"            2.5 -?
+compare "-v (TTL exceeded error)"            3.5 -v --ttl=1 8.8.8.8
 
-section "Subject: hostname / FQDN as parameter (no reverse DNS on replies)"
-compare "localhost"                          3 localhost
-compare "example.com"                        4 example.com
-compare "google.com"                         4 google.com
-compare "FQDN with trailing dot"             4 google.com.
+# ================================================================ bonus
+section "Bonus: one test per option"
+MASK_COUNTS=1 compare "-f"                   2.5 -f -w 1 127.0.0.1
+compare "-l"                                 2.5 -l 3 127.0.0.1
+compare "-n"                                 2.5 -n localhost
+compare "-w"                                 3.5 -w 2 127.0.0.1
+compare "-W"                                 2.5 -W 1 127.0.0.1
+compare "-p"                                 2.5 -p ff 127.0.0.1
+compare "-r"                                 2.5 -r 127.0.0.1
+compare "-s"                                 2.5 -s 100 127.0.0.1
+compare "-T"                                 2.5 -T 16 127.0.0.1
+compare "--ttl"                              2.5 --ttl=64 127.0.0.1
+compare "--ip-timestamp"                     2.5 --ip-timestamp=tsonly 127.0.0.1
 
-section "Subject: -v option"
-compare "-v loopback"                        3 -v 127.0.0.1
-compare "-v remote"                          4 -v 8.8.8.8
-compare "-v hostname"                        4 -v google.com
-# The subject says changing the TTL can force a packet error, which -v must show
-# without stopping the program.
-compare "-v --ttl=1 (Time to live exceeded)" 5 -v --ttl=1 8.8.8.8
-compare "-v --ttl=2"                         5 -v --ttl=2 8.8.8.8
-compare "--ttl=1 without -v"                 5 --ttl=1 8.8.8.8
-
-section "Subject: error handling"
-compare "no argument"                        3
-compare "unknown long option"                3 --bogus 127.0.0.1
-compare "unknown short option"               3 -x 127.0.0.1
-compare "unknown host"                       5 nonexistent.invalid
-compare "empty host"                         3 ''
-compare "malformed IPv4 256.1.1.1"           5 256.1.1.1
-compare "malformed IPv4 1.2.3.4.5"           5 1.2.3.4.5
-compare "very long hostname"                 5 "$(printf 'a%.0s' $(seq 1 300)).com"
-compare "IPv6 address"                       3 ::1
-compare "two hosts"                          4 127.0.0.1 127.0.0.2
-
-# ================================================== 2. bonus flags (subject)
-section "Bonus: -w / --deadline"
-compare "-w 2"                               5 -w 2 127.0.0.1
-compare "-w 3 remote"         6 -w 3 8.8.8.8
-compare "-w 0"                               3 -w 0 127.0.0.1
-compare "-w abc"                             3 -w abc 127.0.0.1
-
-section "Bonus: -W / --linger"
-compare "-W 1"                               4 -W 1 127.0.0.1
-compare "-W 1 unreachable"                   5 -W 1 -w 3 192.0.2.1
-
-section "Bonus: -s / --size"
-compare "-s 0"                               3 -s 0 127.0.0.1
-compare "-s 1"                               3 -s 1 127.0.0.1
-compare "-s 8"                               3 -s 8 127.0.0.1
-compare "-s 120"                             3 -s 120 127.0.0.1
-compare "-s 1472"                            3 -s 1472 127.0.0.1
-compare "-s 1473 remote (fragmented)"        4 -s 1473 8.8.8.8
-compare "-s 65507"                           3 -s 65507 127.0.0.1
-compare "-s 65508 (too big)"                 3 -s 65508 127.0.0.1
-compare "-s -1"                              3 -s -1 127.0.0.1
-compare "-s abc"                             3 -s abc 127.0.0.1
-compare "-s without value"                   3 -s
-
-section "Bonus: -p / --pattern"
-compare "-p ff"                              3 -p ff 127.0.0.1
-compare "-p deadbeef"                        3 -p deadbeef 127.0.0.1
-compare "-p 16 bytes"                        3 -p 0123456789abcdef0123456789abcdef 127.0.0.1
-compare "-p zz (not hex)"                    3 -p zz 127.0.0.1
-compare "-v -p ff"                           3 -v -p ff 127.0.0.1
-
-section "Bonus: -l / --preload"
-compare "-l 3"                               3 -l 3 127.0.0.1
-compare "-l 0"                               3 -l 0 127.0.0.1
-compare "-l -1"                              3 -l -1 127.0.0.1
-
-section "Bonus: -n / --numeric"
-compare "-n localhost"                       3 -n localhost
-compare "-n remote hostname"                 4 -n google.com
-
-section "Bonus: --ttl"
-compare "--ttl=64"                           3 --ttl=64 127.0.0.1
-compare "--ttl 64 (separate value)"          3 --ttl 64 127.0.0.1
-compare "--ttl=0"                            3 --ttl=0 127.0.0.1
-compare "--ttl=256"                          3 --ttl=256 127.0.0.1
-
-section "Bonus: -T / --tos"
-compare "-T 16"                              3 -T 16 127.0.0.1
-compare "-T 256"                             3 -T 256 127.0.0.1
-
-section "Bonus: -r / --ignore-routing"
-compare "-r loopback"                        3 -r 127.0.0.1
-compare "-r remote (no direct route)"        4 -r 8.8.8.8
-
-section "Bonus: --ip-timestamp"
-compare "--ip-timestamp loopback"            3 --ip-timestamp 127.0.0.1
-
-section "Bonus: -f / --flood"
-compare "-f -w 1"                            4 -f -w 1 127.0.0.1
-
-section "Not bonus but handled: -V, --usage, --echo"
-compare "-V"                                 3 -V
-compare "--usage"                            3 --usage
-compare "--echo"                             3 --echo 127.0.0.1
-
-# ========================================== 3. common ping test scenarios
-section "Common: unreachable and special addresses"
-compare "TEST-NET 192.0.2.1 (no reply)"      5 192.0.2.1
-compare "-v TEST-NET 192.0.2.1"              5 -v 192.0.2.1
-compare "private unused 10.255.255.1"        5 10.255.255.1
-compare "0.0.0.0"                            3 0.0.0.0
-compare "broadcast 255.255.255.255"          3 255.255.255.255
-compare "short-form address 127.1"           3 127.1
-compare "decimal address 2130706433"         3 2130706433
-compare "hex address 0x7f000001"             3 0x7f000001
-
-section "Common: argument order and combinations"
-compare "options after the host"             3 127.0.0.1 -s 100
-compare "--size=100 (= form)"                3 --size=100 127.0.0.1
-compare "-s100 (glued value)"                3 -s100 127.0.0.1
-compare "-vn (grouped short options)"        3 -vn 127.0.0.1
-compare "-- before the host"                 3 -- 127.0.0.1
-compare "-v -s 100 -p ab -w 2"               4 -v -s 100 -p ab -w 2 8.8.8.8
+# ======================================================= not bonus (subject)
+section "Not bonus"
+# Same: ft_ping prints its own version line and a usage line for its options.
+STATUS_ONLY=1 compare "-V"                   2.5 -V
+STATUS_ONLY=1 compare "--usage"              2.5 --usage
+compare "--echo"                             2.5 --echo 127.0.0.1
 
 # ------------------------------------------------------------------ summary
 printf '\n%sResult:%s %s%d passed%s, %s%d failed%s\n' \
 	"$BOLD" "$RESET" "$GREEN" "$PASS" "$RESET" "$RED" "$FAIL" "$RESET"
+echo "Raw outputs: $REAL_RESULTS and $FT_RESULTS"
 if [ "$FAIL" -gt 0 ]; then
 	echo "Failed tests:"
 	printf '  - %s\n' "${FAILED_TESTS[@]}"

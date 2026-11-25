@@ -3,14 +3,11 @@
 #include "class.h"   /* t_options */
 
 #define DEFAULT_SIZE 56
-#define MAX_SIZE 65507
+#define MAX_SIZE 65399
 #define DEFAULT_INTERVAL 1.0
+#define FLOOD_INTERVAL 0.01
 
-int parse_double(const char *str, double *out);
-int parse_unsigned(const char *str, unsigned long max, unsigned long *out);
-
-int parse_pattern(const char *s, t_options *o);
-int parse_options(int argc, char **argv, t_options *o, const char **error);
-
-int option_value(int *i, int ac, char **av, const char *arg, const char *name, const char **value);
-int read_option_value(int *index, int argc, char **argv, const char *arg, const char *long_name, const char *short_name, const char **value);
+void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
+unsigned long parse_number(const char *arg, unsigned long min, unsigned long max);
+void parse_pattern(const char *arg, t_options *o);
+void parse_options(int argc, char **argv, t_options *o);

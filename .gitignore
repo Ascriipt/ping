@@ -33,3 +33,7 @@ core.*
 .DS_Store
 Thumbs.db
 ft_ping
+
+# Test result files
+tests/ping_results.txt
+tests/ft_ping_results.txt

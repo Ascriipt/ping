@@ -9,6 +9,8 @@ INC_DIR = includes
 SRC = $(SRC_DIR)/ft_ping.c $(SRC_DIR)/parse.c
 HDR = $(INC_DIR)/class.h $(INC_DIR)/parse.h
 
+TESTS_DIR = tests
+
 all: $(NAME)
 
 $(NAME): $(SRC) $(HDR)
@@ -25,6 +27,7 @@ tests: all
 
 clean-objects:
 	rm -f $(SRC:.c=.o)
+	rm -f $(TESTS_DIR)/*.txt
 
 clean:
 	rm -f $(NAME)

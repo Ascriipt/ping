@@ -1,242 +1,251 @@
-#include <stdbool.h>
+#define _GNU_SOURCE   /* program_invocation_short_name */
+#include <argp.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <errno.h>
-#include <stdio.h>
+#include <strings.h>
+#include <sysexits.h>
 
 #include "parse.h"
 
-int parse_unsigned(const char *str, unsigned long max, unsigned long *out) {
+/* Keys for options that only have a long name. */
+enum {
+	OPT_ECHO = 256,
+	OPT_TTL,
+	OPT_IP_TIMESTAMP,
+	OPT_USAGE,
+};
+
+/* Help groups, same layout as inetutils ping. */
+enum {
+	GRP_TYPES = 10,
+	GRP_ALL = 20,
+	GRP_ECHO = 30,
+};
+
+#define VERSION_TEXT "ft_ping (42 ft_ping) 1.0"
+
+static const struct argp_option g_options[] = {
+	{ NULL, 0, NULL, 0, "Options controlling ICMP request types:", GRP_TYPES },
+	{ "echo", OPT_ECHO, NULL, 0, "send ICMP_ECHO packets (default)", GRP_TYPES },
+
+	{ NULL, 0, NULL, 0, "Options valid for all request types:", GRP_ALL },
+	{ "numeric", 'n', NULL, 0, "do not resolve host addresses", GRP_ALL + 1 },
+	{ "ignore-routing", 'r', NULL, 0,
+		"send directly to a host on an attached network", GRP_ALL + 1 },
+	{ "ttl", OPT_TTL, "N", 0, "specify N as time-to-live", GRP_ALL + 1 },
+	{ "tos", 'T', "NUM", 0, "set type of service (TOS) to NUM", GRP_ALL + 1 },
+	{ "verbose", 'v', NULL, 0, "verbose output", GRP_ALL + 1 },
+	{ "timeout", 'w', "N", 0, "stop after N seconds", GRP_ALL + 1 },
+	{ "linger", 'W', "N", 0, "number of seconds to wait for response", GRP_ALL + 1 },
+
+	{ NULL, 0, NULL, 0, "Options valid for --echo requests:", GRP_ECHO },
+	{ "flood", 'f', NULL, 0, "flood ping (root only)", GRP_ECHO + 1 },
+	{ "ip-timestamp", OPT_IP_TIMESTAMP, "FLAG", 0,
+		"IP timestamp of type FLAG, which is one of \"tsonly\" and \"tsaddr\"",
+		GRP_ECHO + 1 },
+	{ "preload", 'l', "NUMBER", 0,
+		"send NUMBER packets as fast as possible before falling into normal "
+		"mode of behavior (root only)", GRP_ECHO + 1 },
+	{ "pattern", 'p', "PATTERN", 0, "fill ICMP packet with given pattern (hex)",
+		GRP_ECHO + 1 },
+	{ "size", 's', "NUMBER", 0, "send NUMBER data octets", GRP_ECHO + 1 },
+
+	/* argp's own help entries are capitalized; inetutils' are not. */
+	{ "help", '?', NULL, 0, "give this help list", -1 },
+	{ "usage", OPT_USAGE, NULL, 0, "give a short usage message", -1 },
+	{ "version", 'V', NULL, 0, "print program version", -1 },
+	{ NULL, 0, NULL, 0, NULL, 0 },
+};
+
+/* Print "ft_ping: <message>" on stderr and exit with status 1. */
+void die(const char *fmt, ...)
+{
+	va_list ap;
+
+	fprintf(stderr, "%s: ", program_invocation_short_name);
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	fputc('\n', stderr);
+	exit(EXIT_FAILURE);
+}
+
+/*
+ * Number in any C base (strtoul base 0, so 0x10 and 010 work).
+ * A negative number wraps to a huge value, so it is reported as "too big".
+ */
+unsigned long parse_number(const char *arg, unsigned long min, unsigned long max)
+{
 	char *end;
 	unsigned long n;
-	if (!str || !*str || *str == '-')
-		return -1;
+
 	errno = 0;
-	n = strtoul(str, &end, 10);
-	if (errno || *end || n > max)
-		return -1;
-	*out = n;
-	return 0;
+	n = strtoul(arg, &end, 0);
+	if (*end)
+		die("invalid value (`%s' near `%s')", arg, end);
+	if (errno == ERANGE || n > max)
+		die("option value too big: %s", arg);
+	if (n < min)
+		die("option value too small: %s", arg);
+	return n;
 }
 
-int parse_double(const char *str, double *out) {
+/* Up to 16 bytes, read two hex digits at a time. */
+void parse_pattern(const char *arg, t_options *o)
+{
+	const char *p = arg;
+	unsigned int byte;
+	int used;
+
+	o->pattern_len = 0;
+	while (*p && o->pattern_len < sizeof(o->pattern)) {
+		if (sscanf(p, "%2x%n", &byte, &used) != 1)
+			die("error in pattern near %s", p);
+		o->pattern[o->pattern_len++] = (unsigned char)byte;
+		p += used;
+	}
+}
+
+static void parse_preload(const char *arg, t_options *o)
+{
 	char *end;
-	double n;
-	if (!str || !*str || *str == '-')
-		return -1;
+	unsigned long n;
+
 	errno = 0;
-	n = strtod(str, &end);
-	if (errno || *end || n <= 0.0)
-		return -1;
-	*out = n;
-	return 0;
+	n = strtoul(arg, &end, 0);
+	if (*end || errno == ERANGE || n > INT_MAX)
+		die("invalid preload value (%s)", arg);
+	o->preload = (unsigned int)n;
 }
 
-static void usage(FILE *out) {
-	fputs("Usage: ft_ping [OPTION...] HOST\n"
-		"Send ICMP ECHO_REQUEST packets to network hosts.\n\n"
-		"  -?, --help             give this help list\n"
-		"  -v, --verbose          verbose output\n"
-		"  -V, --version          print version and exit\n"
-		"  -f, --flood             send packets as quickly as possible\n"
-		"  -l, --preload=COUNT     send COUNT packets before the regular interval\n"
-		"  -n, --numeric           numeric output only\n"
-		"  -w, --deadline=SEC      stop after SEC seconds\n"
-		"  -W, --timeout=SEC       wait SEC seconds for each reply\n"
-		"  -p, --pattern=HEX       fill payload with a hexadecimal pattern\n"
-		"  -r, --ignore-routing    bypass normal routing tables\n"
-		"  -s, --size=SIZE         payload size in bytes\n"
-		"  -T, --tos=NUM           set IP type of service\n"
-		"      --ttl=NUM           set IP time to live\n"
-		"      --ip-timestamp      request an IP timestamp option\n"
-		"      --usage             give a short usage message\n"
-		"      --echo              send an echo request (compatibility option)\n\n"
-		"Examples:\n"
-		"  ft_ping example.com\n"
-		"  ft_ping --deadline=5 --size=120 192.0.2.1\n",
-		out);
-}
-
-int parse_pattern(const char *s, t_options *o) {
-	size_t n = strlen(s), i;
-	if (n == 0 || (n & 1) || n > sizeof(o->pattern) * 2) return -1;
-	for (i = 0; i < n / 2; i++) {
-		unsigned int byte;
-		if (sscanf(s + i * 2, "%2x", &byte) != 1) return -1;
-		if (!((s[i*2] >= '0' && s[i*2] <= '9') || (s[i*2] >= 'a' && s[i*2] <= 'f') || (s[i*2] >= 'A' && s[i*2] <= 'F')) ||
-			!((s[i*2+1] >= '0' && s[i*2+1] <= '9') || (s[i*2+1] >= 'a' && s[i*2+1] <= 'f') || (s[i*2+1] >= 'A' && s[i*2+1] <= 'F'))) return -1;
-		o->pattern[i] = (unsigned char)byte;
-	}
-	o->pattern_len = n / 2;
-	o->have_pattern = true;
-	return 0;
-}
-
-int option_value(int *i, int ac, char **av, const char *arg, const char *name, const char **value) {
-	size_t n = strlen(name);
-	if (strncmp(arg, name, n) != 0) return 0;
-	if (arg[n] == '=') { *value = arg + n + 1; return 1; }
-	if (arg[n] != '\0') return 0;
-	if (*i + 1 >= ac) return -1;
-	*value = av[++*i];
-	return 1;
-}
-
-int read_option_value(int *index, int argc, char **argv,
-	const char *arg, const char *long_name, const char *short_name,
-	const char **value)
+static void parse_ip_timestamp(const char *arg, t_options *o)
 {
-	int result = option_value(index, argc, argv, arg, long_name, value);
-	if (result != 0)
-		return result;
-	if (short_name && strcmp(arg, short_name) == 0) {
-		if (*index + 1 >= argc)
-			return -1;
-		*value = argv[++*index];
-		return 1;
-	}
-	if (short_name && arg[0] == '-' && arg[1] == short_name[1]
-		&& arg[2] != '\0') {
-		*value = arg + 2;
-		return 1;
+	if (strcasecmp(arg, "tsonly") == 0)
+		o->ip_timestamp = TS_ONLY;
+	else if (strcasecmp(arg, "tsaddr") == 0)
+		o->ip_timestamp = TS_ADDR;
+	else
+		die("unsupported timestamp type: %s", arg);
+}
+
+/* argp writes its "Try ... --help" hint here so the quotes can be fixed. */
+static FILE *g_argp_errors;
+
+static error_t parse_opt(int key, char *arg, struct argp_state *state)
+{
+	t_options *o = state->input;
+
+	switch (key) {
+	case ARGP_KEY_INIT:
+		state->err_stream = g_argp_errors;
+		break;
+	case OPT_ECHO:
+		break;
+	case 'n':
+		o->numeric = true;
+		break;
+	case 'r':
+		o->bypass = true;
+		break;
+	case OPT_TTL:
+		o->ttl = (int)parse_number(arg, 1, 255);
+		o->have_ttl = true;
+		break;
+	case 'T':
+		o->tos = (int)parse_number(arg, 0, 255);
+		o->have_tos = true;
+		break;
+	case 'v':
+		o->verbose = true;
+		break;
+	case 'w':
+		o->deadline = parse_number(arg, 1, INT_MAX);
+		break;
+	case 'W':
+		o->linger = parse_number(arg, 1, INT_MAX);
+		break;
+	case 'f':
+		o->flood = true;
+		break;
+	case OPT_IP_TIMESTAMP:
+		parse_ip_timestamp(arg, o);
+		break;
+	case 'l':
+		parse_preload(arg, o);
+		break;
+	case 'p':
+		parse_pattern(arg, o);
+		break;
+	case 's':
+		o->size = parse_number(arg, 0, MAX_SIZE);
+		break;
+	case '?':
+		argp_state_help(state, stdout, ARGP_HELP_STD_HELP);
+		exit(EXIT_SUCCESS);
+	case OPT_USAGE:
+		argp_state_help(state, stdout, ARGP_HELP_USAGE);
+		exit(EXIT_SUCCESS);
+	case 'V':
+		puts(VERSION_TEXT);
+		exit(EXIT_SUCCESS);
+	case ARGP_KEY_ARG:
+		if (o->host) {
+			argp_error(state, "only one host is supported");
+			return EINVAL;
+		}
+		o->host = arg;
+		break;
+	case ARGP_KEY_NO_ARGS:
+		argp_error(state, "missing host operand");
+		return EINVAL;
+	default:
+		return ARGP_ERR_UNKNOWN;
 	}
 	return 0;
 }
 
-int parse_options(int argc, char **argv, t_options *o,
-	const char **error)
+static const struct argp g_argp = {
+	g_options, parse_opt, "HOST",
+	"Send ICMP ECHO_REQUEST packets to network hosts."
+	"\vOptions marked with (root only) are available only to superuser.",
+	NULL, NULL, NULL,
+};
+
+/*
+ * Usage errors print "ft_ping: <problem>" then a "Try ..." hint and exit 64.
+ * glibc quotes the hint as `ft_ping --help', inetutils as 'ft_ping --help'.
+ */
+void parse_options(int argc, char **argv, t_options *o)
 {
-	int i;
+	char *errors = NULL;
+	size_t errors_len = 0;
+	error_t status;
+	char *c;
+
 	memset(o, 0, sizeof(*o));
 	o->size = DEFAULT_SIZE;
 	o->interval = DEFAULT_INTERVAL;
-
-	for (i = 1; i < argc; i++) {
-		const char *arg = argv[i];
-		const char *value = NULL;
-		unsigned long number;
-		int matched;
-
-		if (strcmp(arg, "--help") == 0 || strcmp(arg, "-?") == 0) {
-			usage(stdout);
-			exit(0);
-		}
-		if (strcmp(arg, "--usage") == 0) {
-			puts("Usage: ft_ping [OPTION...] HOST");
-			exit(0);
-		}
-		if (strcmp(arg, "--version") == 0 || strcmp(arg, "-V") == 0) {
-			puts("ft_ping (42 ft_ping) 1.0");
-			exit(0);
-		}
-		if (strcmp(arg, "--echo") == 0)
-			continue;
-		if (strcmp(arg, "--verbose") == 0 || strcmp(arg, "-v") == 0) {
-			o->verbose = true;
-			continue;
-		}
-		if (strcmp(arg, "--flood") == 0 || strcmp(arg, "-f") == 0) {
-			o->flood = true;
-			o->interval = 0.01;
-			continue;
-		}
-		if (strcmp(arg, "--numeric") == 0 || strcmp(arg, "-n") == 0) {
-			o->numeric = true;
-			continue;
-		}
-		if (strcmp(arg, "--ignore-routing") == 0 || strcmp(arg, "-r") == 0) {
-			o->bypass = true;
-			continue;
-		}
-		if (strcmp(arg, "--ip-timestamp") == 0) {
-			o->have_ip_timestamp = true;
-			continue;
-		}
-
-		matched = read_option_value(&i, argc, argv, arg, "--preload", "-l", &value);
-		if (matched != 0) {
-			if (matched < 0 || parse_unsigned(value, 1000000, &number) < 0) {
-				*error = "--preload expects a whole number between 0 and 1000000";
-				return -1;
-			}
-			o->preload = (unsigned int)number;
-			continue;
-		}
-
-		matched = read_option_value(&i, argc, argv, arg, "--deadline", "-w", &value);
-		if (matched != 0) {
-			if (matched < 0 || parse_double(value, &o->deadline) < 0) {
-				*error = "--deadline expects a number greater than zero";
-				return -1;
-			}
-			o->have_deadline = true;
-			continue;
-		}
-
-		matched = read_option_value(&i, argc, argv, arg, "--timeout", "-W", &value);
-		if (matched != 0) {
-			if (matched < 0 || parse_double(value, &o->timeout) < 0) {
-				*error = "--timeout expects a number greater than zero";
-				return -1;
-			}
-			o->have_timeout = true;
-			continue;
-		}
-
-		matched = read_option_value(&i, argc, argv, arg, "--size", "-s", &value);
-		if (matched != 0) {
-			if (matched < 0 || parse_unsigned(value, MAX_SIZE, &number) < 0) {
-				*error = "--size expects a whole number between 0 and 65507";
-				return -1;
-			}
-			o->size = (size_t)number;
-			continue;
-		}
-
-		matched = read_option_value(&i, argc, argv, arg, "--pattern", "-p", &value);
-		if (matched != 0) {
-			if (matched < 0 || parse_pattern(value, o) < 0) {
-				*error = "--pattern expects an even number of hexadecimal digits (up to 32)";
-				return -1;
-			}
-			continue;
-		}
-
-		matched = read_option_value(&i, argc, argv, arg, "--ttl", NULL, &value);
-		if (matched != 0) {
-			if (matched < 0 || parse_unsigned(value, 255, &number) < 0 || number == 0) {
-				*error = "--ttl expects a whole number between 1 and 255";
-				return -1;
-			}
-			o->ttl = (int)number;
-			o->have_ttl = true;
-			continue;
-		}
-
-		matched = read_option_value(&i, argc, argv, arg, "--tos", "-T", &value);
-		if (matched != 0) {
-			if (matched < 0 || parse_unsigned(value, 255, &number) < 0) {
-				*error = "--tos expects a whole number between 0 and 255";
-				return -1;
-			}
-			o->tos = (int)number;
-			o->have_tos = true;
-			continue;
-		}
-
-		if (arg[0] == '-') {
-			*error = "unknown option";
-			return -1;
-		}
-		if (o->host) {
-			*error = "please provide only one host";
-			return -1;
-		}
-		o->host = arg;
+	g_argp_errors = open_memstream(&errors, &errors_len);
+	if (!g_argp_errors)
+		die("%s", strerror(errno));
+	/* getopt prints argv[0] as typed: show "ft_ping", not "./ft_ping". */
+	argv[0] = program_invocation_short_name;
+	status = argp_parse(&g_argp, argc, argv, ARGP_NO_HELP | ARGP_NO_EXIT, NULL, o);
+	fclose(g_argp_errors);
+	if (status != 0) {
+		for (c = errors; c && *c; c++)
+			if (*c == '`')
+				*c = '\'';
+		if (errors)
+			fputs(errors, stderr);
+		free(errors);
+		exit(EX_USAGE);
 	}
-	if (!o->host) {
-		*error = "please provide a host name or IPv4 address";
-		return -1;
-	}
-	return 0;
+	free(errors);
+	if (o->flood)
+		o->interval = FLOOD_INTERVAL;
 }
