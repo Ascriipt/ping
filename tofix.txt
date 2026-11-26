@@ -1,0 +1,55 @@
+Mostly no. The networking works, but the output copies iputils ping (Fedora's default, which is what ping -V shows on this machine). The subject's reference is inetutils-2.0, and section VI says the output must match it exactly, except for the RTT line and reverse DNS. So the mandatory part would likely fail, and the bonuses aren't graded unless the mandatory part is perfect.
+
+I built it and checked the code by reading it. I couldn't run it, because it needs root and sudo asks for a password here.
+
+What's fine
+
+- The executable is ft_ping, written in C, with a Makefile that has all, clean, fclean and re and doesn't relink when nothing changed.
+- It uses raw ICMP sockets, a hand-written checksum, and ID and sequence matching. It doesn't call a real ping.
+- Both IPv4 addresses and hostnames are resolved with getaddrinfo.
+- -? and --help work. Ctrl-C prints the statistics. Allocations and buffer lengths are checked, so I found no obvious way to make it crash.
+
+Mandatory failures
+
+1. The output format is iputils, not inetutils. These are the main differences:
+
+┌────────────────┬───────────────────────────────────────────────────────────┬───────────────────────────────────────────┐
+│                │                 inetutils-2.0 (required)                  │                   yours                   │
+├────────────────┼───────────────────────────────────────────────────────────┼───────────────────────────────────────────┤
+│ header         │ PING host (1.2.3.4): 56 data bytes                        │ PING host (1.2.3.4) 56(84) bytes of data. │
+├────────────────┼───────────────────────────────────────────────────────────┼───────────────────────────────────────────┤
+│ header with -v │ ..., id 0x1a2b = 6699                                     │ no id shown                               │
+├────────────────┼───────────────────────────────────────────────────────────┼───────────────────────────────────────────┤
+│ reply          │ 64 bytes from 1.2.3.4: icmp_seq=0 ttl=64 time=0.05 ms     │ 64 bytes from NAME (1.2.3.4): ...         │
+├────────────────┼───────────────────────────────────────────────────────────┼───────────────────────────────────────────┤
+│ statistics     │ 3 packets transmitted, 3 packets received, 0% packet loss │ 0.0% and , time Nms                       │
+└────────────────┴───────────────────────────────────────────────────────────┴───────────────────────────────────────────┘
+
+You need to install inetutils (inetutils-ping on Debian) in the VM and compare outputs line by line. Your make tests currently uses REAL_PING=ping, which on this machine is iputils. So the test suite is checking against the wrong reference.
+
+2. It does a reverse DNS lookup. resolve_host calls getnameinfo(..., NI_NAMEREQD) and puts the name in every reply line. The subject says to handle FQDNs without doing the DNS resolution in the packet return. Print only the IP address.
+
+3. -v doesn't do what the subject asks. This is the point graders test, usually by forcing an error with a low TTL (--ttl 1).
+- inetutils prints ICMP errors even without -v, for example 36 bytes from 10.0.0.1: Time to live exceeded. With -v it adds the IP header dump (IP Hdr Dump: / Vr HL TOS Len ID ... / ICMP: type 8, code 0, size 64, id 0x..., seq 0x...).
+- Yours prints nothing without -v. With -v it only prints From X: ICMP type=11 code=0.
+- It doesn't look inside the error packet (the original IP header plus ICMP header) to check that the error belongs to your packet.
+- With -v on 127.0.0.1, it will also print a line for each of its own outgoing echo requests (type 8), because loopback hands them back to the raw socket. inetutils silently ignores those.
+
+4. The error messages and exit codes differ.
+- No host: inetutils prints ping: missing host operand / Try 'ping --help' or 'ping --usage' for more information. and exits with 64.
+- Unknown host: inetutils prints ping: unknown host.
+- Unknown option: inetutils names the bad option.
+- At the end, inetutils exits with 1 if no reply came back. Yours always exits with 0.
+
+Smaller issues
+
+- src/parse.c contains only #include "parse.h". All the parsing functions are in ft_ping.c, so a grader could ask why.
+- -? prints your own help text, not inetutils' text. Same for -V.
+- With -s below 16 there's no room for the timestamp, so it prints time=0.000 ms. inetutils leaves the time out.
+- Short flags can't be combined (-vn is rejected).
+- Bonus -f prints \b on each reply but never prints a . when sending, so flood mode shows nothing.
+- It doesn't check reply checksums and doesn't flag duplicate replies ((DUP!)).
+
+Suggested order
+
+Fix the output format first, then remove the reverse DNS, then make -v and the ICMP error handling match inetutils. After that, re-run your tests against an actual inetutils-2.0 binary (make tests REAL_PING=/path/to/inetutils/ping). I can make these changes if you want.
