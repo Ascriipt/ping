@@ -27,7 +27,6 @@ typedef struct s_options {
 	enum e_timestamp ip_timestamp;
 	unsigned int preload;
 	unsigned long deadline;     /* -w, seconds, 0 = none */
-	unsigned long linger;       /* -W, seconds, 0 = default */
 	double interval;
 	size_t size;
 	int ttl;
@@ -41,6 +40,7 @@ typedef struct s_ping {
 	int fd;
 	struct sockaddr_in dest;
 	char address[INET_ADDRSTRLEN];
+	char hostname[NI_MAXHOST];   /* canonical name, as inetutils prints it */
 	t_options opt;
 	uint16_t id;
 	uint16_t seq;

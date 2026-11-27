@@ -81,9 +81,12 @@ static void resolve_host(t_ping *p)
 	memset(&hints, 0, sizeof(hints));
 	hints.ai_family = AF_INET;
 	hints.ai_socktype = SOCK_RAW;
+	hints.ai_flags = AI_CANONNAME;   /* follow aliases: www.github.com -> github.com */
 	if (getaddrinfo(p->opt.host, NULL, &hints, &res) != 0 || !res)
 		die("unknown host");
 	memcpy(&p->dest, res->ai_addr, sizeof(p->dest));
+	snprintf(p->hostname, sizeof(p->hostname), "%s",
+		res->ai_canonname ? res->ai_canonname : p->opt.host);
 	freeaddrinfo(res);
 	inet_ntop(AF_INET, &p->dest.sin_addr, p->address, sizeof(p->address));
 }
@@ -390,7 +393,7 @@ static void print_stats(const t_ping *p) {
 	double average;
 	double deviation;
 
-	printf("--- %s ping statistics ---\n", p->opt.host);
+	printf("--- %s ping statistics ---\n", p->hostname);
 	printf("%lu packets transmitted, %lu packets received, %lu%% packet loss\n",
 		p->sent, p->received,
 		p->sent > 0 ? (p->sent - p->received) * 100 / p->sent : 0);
@@ -468,7 +471,7 @@ int main(int ac, char **av) {
 	resolve_host(&p);
 	open_socket(&p);
 	p.id = (uint16_t)getpid();
-	printf("PING %s (%s): %zu data bytes", p.opt.host, p.address, p.opt.size);
+	printf("PING %s (%s): %zu data bytes", p.hostname, p.address, p.opt.size);
 	if (p.opt.verbose)
 		printf(", id 0x%04x = %u", p.id, p.id);
 	printf("\n");

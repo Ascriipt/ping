@@ -183,7 +183,6 @@ MASK_COUNTS=1 compare "-f"                   2.5 -f -w 1 127.0.0.1
 compare "-l"                                 2.5 -l 3 127.0.0.1
 compare "-n"                                 2.5 -n localhost
 compare "-w"                                 3.5 -w 2 127.0.0.1
-compare "-W"                                 2.5 -W 1 127.0.0.1
 compare "-p"                                 2.5 -p ff 127.0.0.1
 compare "-r"                                 2.5 -r 127.0.0.1
 compare "-s"                                 2.5 -s 100 127.0.0.1

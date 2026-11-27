@@ -16,7 +16,7 @@ Run it with a hostname or IPv4 address:
 
 ```sh
 ./ft_ping example.com
-./ft_ping --deadline=5 --size=120 192.0.2.1
+./ft_ping --timeout=5 --size=120 192.0.2.1
 ```
 
 Opening a raw socket usually requires root privileges or the appropriate
@@ -64,7 +64,7 @@ statistics, and a copy of the parsed options.
 | Function | Purpose |
 | --- | --- |
 | `icmp_checksum` | Computes the Internet checksum over the ICMP packet before it is sent. |
-| `resolve_host` | Resolves the supplied destination as IPv4, stores its numeric address, and looks up a display name unless numeric output was requested. |
+| `resolve_host` | Resolves the supplied destination as IPv4, stores its numeric address, and keeps its canonical name (`AI_CANONNAME`) for the `PING` and statistics lines, like inetutils. |
 | `open_socket` | Opens the raw ICMP socket and applies requested socket settings such as route bypass, TTL, TOS, and the IP timestamp option. |
 | `send_echo` | Builds an ICMP echo-request packet with the current identifier and sequence number, adds the timestamp/payload pattern, calculates the checksum, and sends it to the destination. |
 | `recv_reply` | Reads a packet from the socket, validates the IP and ICMP headers, ignores packets that are not replies for this process, calculates RTT, updates counters/statistics, and prints the reply. With `-v`, it also displays other ICMP packets it sees. |
@@ -117,7 +117,6 @@ perfectly. Test each feature separately and confirm it behaves as described.
 | `-l COUNT` | Run `./ft_ping -l 3 -w 2 127.0.0.1`. Confirm the initial preload packets are sent quickly before regular interval sending. |
 | `-n` | Run `./ft_ping -n -w 2 example.com`. Confirm output uses numeric addresses without reverse-name display. |
 | `-w SEC` | Run `./ft_ping -w 2 127.0.0.1`. Confirm the session ends after the deadline and prints statistics. |
-| `-W SEC` | Run `./ft_ping -W 0.5 -w 2 127.0.0.1`. Confirm the reply wait timeout is accepted and the overall deadline still ends the session. |
 | `-p HEX` | Run `./ft_ping -p deadbeef -s 64 -w 2 127.0.0.1`. Confirm a valid hexadecimal payload pattern is accepted; also check malformed or odd-length patterns are rejected cleanly. |
 | `-r` | Run `./ft_ping -r -w 2 127.0.0.1`. Confirm the route-bypass option is accepted and applied where the OS supports it. |
 | `-s SIZE` | Run `./ft_ping -s 120 -w 2 127.0.0.1`. Confirm the requested payload size is reflected in the output and replies. |

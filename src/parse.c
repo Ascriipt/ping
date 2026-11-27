@@ -40,7 +40,6 @@ static const struct argp_option g_options[] = {
 	{ "tos", 'T', "NUM", 0, "set type of service (TOS) to NUM", GRP_ALL + 1 },
 	{ "verbose", 'v', NULL, 0, "verbose output", GRP_ALL + 1 },
 	{ "timeout", 'w', "N", 0, "stop after N seconds", GRP_ALL + 1 },
-	{ "linger", 'W', "N", 0, "number of seconds to wait for response", GRP_ALL + 1 },
 
 	{ NULL, 0, NULL, 0, "Options valid for --echo requests:", GRP_ECHO },
 	{ "flood", 'f', NULL, 0, "flood ping (root only)", GRP_ECHO + 1 },
@@ -164,9 +163,6 @@ static error_t parse_opt(int key, char *arg, struct argp_state *state)
 		break;
 	case 'w':
 		o->deadline = parse_number(arg, 1, INT_MAX);
-		break;
-	case 'W':
-		o->linger = parse_number(arg, 1, INT_MAX);
 		break;
 	case 'f':
 		o->flood = true;
